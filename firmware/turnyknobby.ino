@@ -1,136 +1,91 @@
+/*
+ * XIAO ESP32-S3 VOLUME CONTROLLER
+ */
+
 #include <Arduino.h>
-#include <BleKeyboard.h>
 
-// ---------------- PIN MAPPING ----------------
+// ---------- Hardware Pins Mappings ----------
+#define ENC_A_PIN   2   
+#define ENC_B_PIN   1   
+#define ENC_SW_PIN  44 
 
-// Encoder
-#define ENC_A 1
-#define ENC_B 2
-#define ENC_SW 8
+const uint8_t LED_PINS[] = {8, 4, 43, 7, 3, 9, 5, 6}; 
+const uint8_t NUM_LEDS = sizeof(LED_PINS) / sizeof(LED_PINS[0]);
 
-// LEDs in PHYSICAL ORDER (your PCB layout)
-const int ledPins[8] = {
-  6,   // D6
-  5,   // D5
-  11,  // D8
-  3,   // D3
-  9,   // D9
-  7,   // D7
-  4,   // D4
-  10   // D1
-};
+// ---------- SOFT-POWER LIMITING CONFIGURATION ----------
+const uint8_t MAX_BRIGHTNESS = 30; 
 
-// ---------------- CONFIG ----------------
+// ---------- Core State Variables ----------
+volatile int8_t  encoderDelta = 0;
+volatile uint8_t lastEncoded  = 0;
 
-#define ENCODER_STEPS_PER_NOTCH 2
-#define VOL_MIN 0
-#define VOL_MAX 100
+int volume = 50;
+const int VOLUME_STEP = 4;
 
-BleKeyboard bleKeyboard("Volume Knob", "Custom", 100);
+void updateLEDs(bool slow);
 
-// ---------------- STATE ----------------
+void IRAM_ATTR encoderISR() {
+  uint8_t MSB = digitalRead(ENC_A_PIN);
+  uint8_t LSB = digitalRead(ENC_B_PIN);
+  uint8_t encoded = (MSB << 1) | LSB;
+  uint8_t sum = (lastEncoded << 2) | encoded;
 
-volatile int encoderValue = 0;
-int lastEncoded = 0;
-
-int volumeLevel = 50;
-bool lastButtonState = HIGH;
-
-// ---------------- ENCODER ISR ----------------
-
-void IRAM_ATTR readEncoder() {
-  int MSB = digitalRead(ENC_A);
-  int LSB = digitalRead(ENC_B);
-
-  int encoded = (MSB << 1) | LSB;
-  int sum  = (lastEncoded << 2) | encoded;
-
-  if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011)
-    encoderValue++;
-
-  if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000)
-    encoderValue--;
-
+  if (sum == 0b1101 || sum == 0b0100 || sum == 0b0010 || sum == 0b1011) {
+    encoderDelta++; 
+  } else if (sum == 0b1110 || sum == 0b0111 || sum == 0b0001 || sum == 0b1000) {
+    encoderDelta--; 
+  }
   lastEncoded = encoded;
 }
-
-// ---------------- LED CONTROL ----------------
-
-void updateLEDs(int volume) {
-  int ledsToLight = map(volume, VOL_MIN, VOL_MAX, 0, 8);
-
-  for (int i = 0; i < 8; i++) {
-    digitalWrite(ledPins[i], i < ledsToLight ? HIGH : LOW);
-  }
-}
-
-// ---------------- BLE VOLUME ----------------
-
-void sendVolumeChange(int steps) {
-  if (!bleKeyboard.isConnected()) return;
-
-  while (steps > 0) {
-    bleKeyboard.write(KEY_MEDIA_VOLUME_UP);
-    steps--;
-  }
-
-  while (steps < 0) {
-    bleKeyboard.write(KEY_MEDIA_VOLUME_DOWN);
-    steps++;
-  }
-}
-
-// ---------------- SETUP ----------------
 
 void setup() {
   Serial.begin(115200);
 
-  pinMode(ENC_A, INPUT_PULLUP);
-  pinMode(ENC_B, INPUT_PULLUP);
-  pinMode(ENC_SW, INPUT_PULLUP);
+  pinMode(ENC_A_PIN, INPUT_PULLUP);
+  pinMode(ENC_B_PIN, INPUT_PULLUP);
+  pinMode(ENC_SW_PIN, INPUT_PULLUP);
 
-  attachInterrupt(digitalPinToInterrupt(ENC_A), readEncoder, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(ENC_B), readEncoder, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_A_PIN), encoderISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_B_PIN), encoderISR, CHANGE);
 
-  for (int i = 0; i < 8; i++) {
-    pinMode(ledPins[i], OUTPUT);
-    digitalWrite(ledPins[i], LOW);
+  for (uint8_t i = 0; i < NUM_LEDS; i++) {
+    ledcAttach(LED_PINS[i], 5000, 8); 
+    ledcWrite(LED_PINS[i], 0);
   }
 
-  bleKeyboard.begin();
+  updateLEDs(true); 
+  Serial.println("System active with safe reversed directional pins!");
 }
 
-// ---------------- LOOP ----------------
-
 void loop() {
-  static int lastEncoderValue = 0;
+  if (encoderDelta != 0) {
+    noInterrupts();
+    int8_t delta = encoderDelta;
+    encoderDelta = 0;
+    interrupts();
 
-  // ----- Encoder handling -----
-  int delta = encoderValue - lastEncoderValue;
-
-  if (abs(delta) >= ENCODER_STEPS_PER_NOTCH) {
-    int steps = delta / ENCODER_STEPS_PER_NOTCH;
-
-    volumeLevel += steps * 2; // sensitivity
-    volumeLevel = constrain(volumeLevel, VOL_MIN, VOL_MAX);
-
-    sendVolumeChange(steps);
-    updateLEDs(volumeLevel);
-
-    lastEncoderValue += steps * ENCODER_STEPS_PER_NOTCH;
+    volume = constrain(volume + (delta > 0 ? VOLUME_STEP : -VOLUME_STEP), 0, 100);
+    updateLEDs(false);
   }
 
-  // ----- Button (Mute) -----
-  bool currentButton = digitalRead(ENC_SW);
+  delay(2);
+}
 
-  if (lastButtonState == HIGH && currentButton == LOW) {
-    if (bleKeyboard.isConnected()) {
-      bleKeyboard.write(KEY_MEDIA_MUTE);
+void updateLEDs(bool slow) {
+  uint8_t litCount = map(volume, 0, 100, 0, NUM_LEDS);
+
+  for (uint8_t i = 0; i < NUM_LEDS; i++) {
+    if (i < litCount) {
+      if (slow) {
+        for (int b = 0; b <= MAX_BRIGHTNESS; b += 2) {
+          ledcWrite(LED_PINS[i], b);
+          delay(8);
+        }
+      } else {
+        ledcWrite(LED_PINS[i], MAX_BRIGHTNESS);
+      }
+    } else {
+      ledcWrite(LED_PINS[i], 0);
     }
-    delay(200); // debounce
   }
-
-  lastButtonState = currentButton;
-
-  delay(5);
 }
